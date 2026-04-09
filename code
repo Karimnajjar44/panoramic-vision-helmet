@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+import cv2
+import numpy as np
+import time
+import math
+import serial
+import re
+
+# =========================================================
+# CAMERA / PANO CONFIG
+# =========================================================
+W, H = 640, 480
+LEFT_CAM  = 2
+RIGHT_CAM = 0
+
+YAW_TOTAL_DEG = 10.0
+FEATHER       = 80
+SEAM_SHIFT    = -40
+PANOSCALE     = 0.75
+
+# =========================================================
+# DISPLAY / VR CONFIG
+# =========================================================
+DISP_W, DISP_H = 1280, 720
+FILL_DISPLAY = True
+
+VR_MODE = True
+EYE_W  = DISP_W // 2
+EYE_H  = DISP_H
+
+# =========================================================
+# HUD / SERIAL CONFIG
+# =========================================================
+HUD_ALPHA   = 0.6
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE   = 115200
+
+SERIAL_INTERVAL = 0.03
+SMOOTH_ALPHA    = 0.5
+
+# =========================================================
+# SERIAL HELPERS
+# =========================================================
+def read_distances_from_serial(ser):
+    try:
+        line = ser.readline().decode(errors="ignore")
+    except:
+        return None, None
+
+    nums = re.findall(r"[-+]?\d*\.\d+|\d+", line)
+    if len(nums) >= 2:
+        try:
+            return float(nums[0]), float(nums[1])
+        except:
+            pass
+    return None, None
+
+def smooth(new, old):
+    if new is None: return old
+    if old is None: return new
+    return SMOOTH_ALPHA * new + (1 - SMOOTH_ALPHA) * old
+
+# =========================================================
+# HUD DRAWING
+# =========================================================
+def dist_color(d):
+    if d is None or d >= 3.0: return (0,255,0)
+    if d >= 2.0: return (0,255,255)
+    if d >= 1.0: return (0,165,255)
+    return (0,0,255)
+
+def draw_distance_boxes(img, dl, dr):
+    h, w = img.shape[:2]
+    bw, bh = int(w*0.12), int(h*0.06)
+    m = int(min(w,h)*0.015)
+
+    def box(x, d):
+        y = m
+        cv2.rectangle(img, (x,y), (x+bw,y+bh), dist_color(d), -1)
+        txt = "--" if d is None else f"{d:.1f}m"
+        cv2.putText(img, txt, (x+10,y+bh-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+
+    box(m, dl)
+    box(w-m-bw, dr)
+
+def draw_lap_pos(img, lap_c, lap_t, pos_c, pos_t):
+    h, w = img.shape[:2]
+    bw, bh = int(w*0.12), int(h*0.08)
+    m = int(min(w,h)*0.015)
+    y = m + bh + int(h*0.01)
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (m,y), (m+bw,y+bh), (0,0,0), -1)
+    cv2.addWeighted(overlay, HUD_ALPHA, img, 1-HUD_ALPHA, 0, img)
+
+    cv2.putText(img, f"Lap {lap_c}/{lap_t}",
+                (m+10, y+int(bh*0.4)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+    cv2.putText(img, f"Pos {pos_c}/{pos_t}",
+                (m+10, y+int(bh*0.8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+
+def draw_center_hud(img, speed=111, rpm=9000, gear=8):
+    h, w = img.shape[:2]
+    hw, hh = int(w*0.5), int(h*0.22)
+    cx, cy = w//2, int(h*0.85)
+
+    x1, y1 = cx-hw//2, cy-hh//2
+    x2, y2 = cx+hw//2, cy+hh//2
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1,y1), (x2,y2), (0,0,0), -1)
+    cv2.addWeighted(overlay, HUD_ALPHA, img, 1-HUD_ALPHA, 0, img)
+
+    cv2.putText(img, f"{speed} km/h", (x1+40,y1+hh//2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 2)
+    cv2.putText(img, f"{rpm}", (x2-160,y1+hh//2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255,255,255), 2)
+    cv2.putText(img, str(gear), (cx-20, cy+20),
+                cv2.FONT_HERSHEY_SIMPLEX, 3.5, (0,255,255), 4)
+
+def draw_flag_box(img, flag_mode):
+    if flag_mode is None:
+        return
+
+    h, w = img.shape[:2]
+    bw, bh = int(w*0.75), int(h*0.06)
+    m = int(min(w,h)*0.015)
+
+    x1 = w//2 - bw//2
+    y1 = m
+    x2 = x1 + bw
+    y2 = y1 + bh
+
+    colors = {
+        'green':(0,255,0),
+        'yellow':(0,255,255),
+        'blue':(255,0,0),
+        'red':(0,0,255)
+    }
+
+    if flag_mode in colors:
+        cv2.rectangle(img, (x1,y1), (x2,y2), colors[flag_mode], -1)
+    elif flag_mode == 'bw':
+        mid = (x1+x2)//2
+        cv2.rectangle(img, (x1,y1), (mid,y2), (255,255,255), -1)
+        cv2.rectangle(img, (mid,y1), (x2,y2), (0,0,0), -1)
+
+    cv2.rectangle(img, (x1,y1), (x2,y2), (50,50,50), 2)
+
+# =========================================================
+# PANO HELPERS
+# =========================================================
+def rot_y(deg):
+    a = math.radians(deg)
+    return np.array([[ math.cos(a),0, math.sin(a)],
+                     [ 0,          1, 0          ],
+                     [-math.sin(a),0, math.cos(a)]], np.float32)
+
+def build_alpha(maskL, maskR):
+    overlap = (maskL > 0) & (maskR > 0)
+    cols = np.where(overlap.any(axis=0))[0]
+    h, w = maskL.shape
+    alpha = np.zeros((h,w), np.float32)
+
+    if len(cols) == 0:
+        return alpha[...,None]
+
+    band = int(min((cols[-1]-cols[0])*0.4, FEATHER)//2)
+    seam = int((cols[0]+cols[-1])/2 + SEAM_SHIFT)
+    x0 = max(cols[0], seam-band)
+    x1 = min(cols[-1], seam+band)
+
+    alpha[:,x1:] = 1.0
+    if x1 > x0:
+        t = np.linspace(0,1,x1-x0)
+        t = t*t*(3-2*t)
+        alpha[:,x0:x1] = t[None,:]
+
+    return alpha[...,None]
+
+def fit_display(img):
+    h, w = img.shape[:2]
+    s = max(DISP_W/w, DISP_H/h) if FILL_DISPLAY else min(DISP_W/w, DISP_H/h)
+    img = cv2.resize(img, (int(w*s), int(h*s)))
+    y0 = max(0, (img.shape[0]-DISP_H)//2)
+    x0 = max(0, (img.shape[1]-DISP_W)//2)
+    return img[y0:y0+DISP_H, x0:x0+DISP_W]
+
+# =========================================================
+# VR VIEW (UNCHANGED)
+# =========================================================
+def make_vr_view(img):
+    eye = cv2.resize(img, (EYE_W, EYE_H))
+    vr = np.zeros((EYE_H, EYE_W*2, 3), dtype=img.dtype)
+    vr[:, :EYE_W] = eye
+    vr[:, EYE_W:] = eye
+    return vr
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    capL = cv2.VideoCapture(LEFT_CAM, cv2.CAP_V4L2)
+    capR = cv2.VideoCapture(RIGHT_CAM, cv2.CAP_V4L2)
+
+    for c in (capL, capR):
+        c.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+        c.set(cv2.CAP_PROP_FPS, 30)
+
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0)
+    except:
+        ser = None
+
+    dl = dr = None
+    last_serial = 0
+    lap_c, lap_t = 1, 58
+    pos_c, pos_t = 1, 22
+    flag_mode = None
+    flag_time = 0
+
+    fx = fy = 425
+    K = np.array([[fx,0,W/2],[0,fy,H/2],[0,0,1]], np.float32)
+
+    HL = K @ rot_y(-YAW_TOTAL_DEG/2) @ np.linalg.inv(K)
+    HR = K @ rot_y(+YAW_TOTAL_DEG/2) @ np.linalg.inv(K)
+
+    corners = np.array([[0,0],[W,0],[W,H],[0,H]], np.float32).reshape(-1,1,2)
+    cL = cv2.perspectiveTransform(corners, HL)
+    cR = cv2.perspectiveTransform(corners, HR)
+
+    xs = np.concatenate([cL[:,0,0], cR[:,0,0]])
+    ys = np.concatenate([cL[:,0,1], cR[:,0,1]])
+
+    pano_w = int(xs.max() - xs.min())
+    pano_h = int(ys.max() - ys.min())
+
+    T = np.array([[1,0,-xs.min()],
+                  [0,1,-ys.min()],
+                  [0,0,1]], np.float32)
+
+    HL = T @ HL
+    HR = T @ HR
+
+    base = np.ones((H,W), np.uint8)*255
+    alpha = build_alpha(
+        cv2.warpPerspective(base, HL, (pano_w, pano_h)),
+        cv2.warpPerspective(base, HR, (pano_w, pano_h))
+    )
+
+    cv2.namedWindow("PanoramaHUD", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("PanoramaHUD",
+                          cv2.WND_PROP_FULLSCREEN,
+                          cv2.WINDOW_FULLSCREEN)
+
+    last = time.time()
+    fps = 0
+
+    while True:
+        okL, L = capL.read()
+        okR, R = capR.read()
+        if not okL or not okR:
+            continue
+
+        Lw = cv2.warpPerspective(L, HL, (pano_w, pano_h))
+        Rw = cv2.warpPerspective(R, HR, (pano_w, pano_h))
+        pano = (Lw*(1-alpha) + Rw*alpha).astype(np.uint8)
+
+        if PANOSCALE != 1.0:
+            pano = cv2.resize(pano, None, fx=PANOSCALE, fy=PANOSCALE)
+
+        pano = fit_display(pano)
+
+        now = time.time()
+        fps = 0.9*fps + 0.1*(1/(now-last))
+        last = now
+
+        if ser and now-last_serial > SERIAL_INTERVAL:
+            nl, nr = read_distances_from_serial(ser)
+            dl = smooth(nl, dl)
+            dr = smooth(nr, dr)
+            last_serial = now
+
+        # auto-clear flag
+        if flag_mode and now - flag_time > 5:
+            flag_mode = None
+
+        draw_distance_boxes(pano, dl, dr)
+        draw_lap_pos(pano, lap_c, lap_t, pos_c, pos_t)
+        draw_flag_box(pano, flag_mode)
+        draw_center_hud(pano)
+
+        cv2.putText(pano, f"{fps:.1f} FPS", (20, DISP_H-20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+        out = make_vr_view(pano) if VR_MODE else pano
+        cv2.imshow("PanoramaHUD", out)
+
+        k = cv2.waitKey(1) & 0xFF
+
+        if k == ord('q'):
+            break
+        elif k == ord('g'):
+            flag_mode = 'green'; flag_time = now
+        elif k == ord('y'):
+            flag_mode = 'yellow'; flag_time = now
+        elif k == ord('b'):
+            flag_mode = 'blue'; flag_time = now
+        elif k == ord('r'):
+            flag_mode = 'red'; flag_time = now
+        elif k == ord('w'):
+            flag_mode = 'bw'; flag_time = now
+        elif k == ord('c'):
+            flag_mode = 'chequered'; flag_time = now
+        elif k == ord('i'):
+            lap_c = min(lap_t, lap_c + 1)
+        elif k == ord('k'):
+            lap_c = max(1, lap_c - 1)
+        elif k == ord('l'):
+            pos_c = min(pos_t, pos_c + 1)
+        elif k == ord('j'):
+            pos_c = max(1, pos_c - 1)
+
+    capL.release()
+    capR.release()
+    if ser: ser.close()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
